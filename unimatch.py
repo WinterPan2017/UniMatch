@@ -25,7 +25,7 @@ parser.add_argument('--config', type=str, required=True)
 parser.add_argument('--labeled-id-path', type=str, required=True)
 parser.add_argument('--unlabeled-id-path', type=str, required=True)
 parser.add_argument('--save-path', type=str, required=True)
-parser.add_argument('--local_rank', default=0, type=int)
+parser.add_argument('--local-rank', default=0, type=int)
 parser.add_argument('--port', default=None, type=int)
 
 
@@ -60,6 +60,25 @@ def main():
 
     local_rank = int(os.environ["LOCAL_RANK"])
     model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+
+    previous_best = 0.0
+    epoch = -1
+    if os.path.exists(os.path.join(args.save_path, 'latest.pth')): # memory effient loading
+        checkpoint = torch.load(os.path.join(args.save_path, 'latest.pth'), map_location='cpu')
+        model.load_state_dict({k[7:]: v for k, v in checkpoint['model'].items()})
+
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        epoch = checkpoint['epoch']
+        previous_best = checkpoint['previous_best']
+        
+        for state in optimizer.state.values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    state[k] = v.cuda()
+                    
+        if rank == 0:
+            logger.info('************ Load from checkpoint at epoch %i\n' % epoch)
+
     model.cuda()
 
     model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], broadcast_buffers=False,
@@ -91,18 +110,18 @@ def main():
                            drop_last=False, sampler=valsampler)
 
     total_iters = len(trainloader_u) * cfg['epochs']
-    previous_best = 0.0
-    epoch = -1
+    # previous_best = 0.0
+    # epoch = -1
     
-    if os.path.exists(os.path.join(args.save_path, 'latest.pth')):
-        checkpoint = torch.load(os.path.join(args.save_path, 'latest.pth'))
-        model.load_state_dict(checkpoint['model'])
-        optimizer.load_state_dict(checkpoint['optimizer'])
-        epoch = checkpoint['epoch']
-        previous_best = checkpoint['previous_best']
+    # if os.path.exists(os.path.join(args.save_path, 'latest.pth')):
+    #     checkpoint = torch.load(os.path.join(args.save_path, 'latest.pth'))
+    #     model.load_state_dict(checkpoint['model'])
+    #     optimizer.load_state_dict(checkpoint['optimizer'])
+    #     epoch = checkpoint['epoch']
+    #     previous_best = checkpoint['previous_best']
         
-        if rank == 0:
-            logger.info('************ Load from checkpoint at epoch %i\n' % epoch)
+    #     if rank == 0:
+    #         logger.info('************ Load from checkpoint at epoch %i\n' % epoch)
     
     for epoch in range(epoch + 1, cfg['epochs']):
         if rank == 0:
