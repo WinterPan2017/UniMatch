@@ -1,8 +1,8 @@
 # arguments for dataset
 dataset: pascal
 nclass: 21
-crop_size: 321
-data_root: Your/Pascal/Path
+crop_size: 513
+data_root: /data/pwt/VOCdevkit/VOC2012/
 
 # arguments for training
 epochs: 80
@@ -20,3 +20,8 @@ model: deeplabv3plus
 backbone: resnet101
 replace_stride_with_dilation: [False, False, True]
 dilations: [6, 12, 18]
+
+#lcr
+mask_ratio: 0.7
+patch_size: 32
+lcr_weight: 0.1
