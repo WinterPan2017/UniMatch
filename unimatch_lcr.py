@@ -26,7 +26,7 @@ parser.add_argument('--config', type=str, required=True)
 parser.add_argument('--labeled-id-path', type=str, required=True)
 parser.add_argument('--unlabeled-id-path', type=str, required=True)
 parser.add_argument('--save-path', type=str, required=True)
-parser.add_argument('--local_rank', default=0, type=int)
+parser.add_argument('--local-rank', default=0, type=int)
 parser.add_argument('--port', default=None, type=int)
 
 
@@ -199,12 +199,15 @@ def main():
             loss_u_w_fp = loss_u_w_fp.sum() / (ignore_mask != 255).sum().item()
 
             # lcr
-            loss_u_lcr = criterion_u(pred_u_masked, mask_u_w)
-            loss_u_lcr = loss_u_lcr * ((conf_u_w >= cfg['conf_thresh']) & (ignore_mask != 255))
-            loss_u_lcr = loss_u_lcr.sum() / (ignore_mask != 255).sum().item()
+            if epoch >= cfg['lcr_start_epoch']:
+                loss_u_lcr = criterion_u(pred_u_masked, mask_u_w)
+                loss_u_lcr = loss_u_lcr * ((conf_u_w >= cfg['lcr_conf_thresh']) & (ignore_mask != 255))
+                loss_u_lcr = loss_u_lcr.sum() / (ignore_mask != 255).sum().item()
+                loss = (loss_x + loss_u_s1 * 0.25 + loss_u_s2 * 0.25 + loss_u_w_fp * 0.5 + loss_u_lcr*cfg['lcr_weight']) / (2.0 + cfg['lcr_weight'])
+            else:
 
-            # loss = (loss_x + loss_u_s1 * 0.25 + loss_u_s2 * 0.25 + loss_u_w_fp * 0.5) / 2.0
-            loss = (loss_x + loss_u_s1 * 0.25 + loss_u_s2 * 0.25 + loss_u_w_fp * 0.5 + loss_u_lcr*cfg['lcr_weight']) / (2.0 + cfg['lcr_weight'])
+                loss = (loss_x + loss_u_s1 * 0.25 + loss_u_s2 * 0.25 + loss_u_w_fp * 0.5) / 2.0
+            # loss = (loss_x + loss_u_s1 * 0.25 + loss_u_s2 * 0.25 + loss_u_w_fp * 0.5 + loss_u_lcr*cfg['lcr_weight']) / (2.0 + cfg['lcr_weight'])
 
             torch.distributed.barrier()
 

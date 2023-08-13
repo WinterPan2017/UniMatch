@@ -2,7 +2,7 @@
 dataset: pascal
 nclass: 21
 crop_size: 513
-data_root: /data/pwt/VOCdevkit/VOC2012/
+data_root: /data0/pwt/VOCdevkit/VOC2012/
 
 # arguments for training
 epochs: 80
@@ -25,3 +25,5 @@ dilations: [6, 12, 18]
 mask_ratio: 0.7
 patch_size: 32
 lcr_weight: 0.1
+lcr_conf_thresh: 0.95
+lcr_start_epoch: 1
