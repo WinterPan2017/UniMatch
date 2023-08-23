@@ -114,6 +114,7 @@ def main():
         total_loss_x = AverageMeter()
         total_loss_s = AverageMeter()
         total_loss_w_fp = AverageMeter()
+        total_loss_lcr = AverageMeter()
         total_mask_ratio = AverageMeter()
 
         trainloader_l.sampler.set_epoch(epoch)
@@ -142,12 +143,7 @@ def main():
 
             with torch.no_grad():
                 model.eval()
-
-                # pred_u_w_mix = model(img_u_w_mix).detach()
-                # conf_u_w_mix = pred_u_w_mix.softmax(dim=1).max(dim=1)[0]
-                # mask_u_w_mix = pred_u_w_mix.argmax(dim=1)
-                preds = model(torch.cat((img_u_w_mix, img_masked))).detach()
-                pred_u_w_mix, pred_u_masked = preds.split([num_unlabeled, num_unlabeled])
+                pred_u_w_mix = model(img_u_w_mix).detach()
                 conf_u_w_mix = pred_u_w_mix.softmax(dim=1).max(dim=1)[0]
                 mask_u_w_mix = pred_u_w_mix.argmax(dim=1)
                 
@@ -165,7 +161,7 @@ def main():
             pred_x, pred_u_w = preds.split([num_lb, num_ulb])
             pred_u_w_fp = preds_fp[num_lb:]
 
-            pred_u_s1, pred_u_s2 = model(torch.cat((img_u_s1, img_u_s2))).chunk(2)
+            pred_u_s1, pred_u_s2, pred_u_masked = model(torch.cat((img_u_s1, img_u_s2, img_masked))).chunk(3)
 
             pred_u_w = pred_u_w.detach()
             conf_u_w = pred_u_w.softmax(dim=1).max(dim=1)[0]
@@ -202,7 +198,7 @@ def main():
             if epoch >= cfg['lcr_start_epoch']:
                 loss_u_lcr = criterion_u(pred_u_masked, mask_u_w)
                 loss_u_lcr = loss_u_lcr * ((conf_u_w >= cfg['lcr_conf_thresh']) & (ignore_mask != 255))
-                loss_u_lcr = loss_u_lcr.sum() / (ignore_mask != 255).sum().item()
+                loss_u_lcr = loss_u_lcr.sum() /((conf_u_w >= cfg['lcr_conf_thresh']) & (ignore_mask != 255)).sum().item()
                 loss = (loss_x + loss_u_s1 * 0.25 + loss_u_s2 * 0.25 + loss_u_w_fp * 0.5 + loss_u_lcr*cfg['lcr_weight']) / (2.0 + cfg['lcr_weight'])
             else:
 
@@ -219,6 +215,7 @@ def main():
             total_loss_x.update(loss_x.item())
             total_loss_s.update((loss_u_s1.item() + loss_u_s2.item()) / 2.0)
             total_loss_w_fp.update(loss_u_w_fp.item())
+            total_loss_lcr.update(loss_u_lcr.item())
             
             mask_ratio = ((conf_u_w >= cfg['conf_thresh']) & (ignore_mask != 255)).sum().item() / \
                 (ignore_mask != 255).sum()
@@ -234,12 +231,13 @@ def main():
                 writer.add_scalar('train/loss_x', loss_x.item(), iters)
                 writer.add_scalar('train/loss_s', (loss_u_s1.item() + loss_u_s2.item()) / 2.0, iters)
                 writer.add_scalar('train/loss_w_fp', loss_u_w_fp.item(), iters)
+                writer.add_scalar('train/loss_lcr', loss_u_lcr.item(), iters)
                 writer.add_scalar('train/mask_ratio', mask_ratio, iters)
             
             if (i % (len(trainloader_u) // 8) == 0) and (rank == 0):
-                logger.info('Iters: {:}, Total loss: {:.3f}, Loss x: {:.3f}, Loss s: {:.3f}, Loss w_fp: {:.3f}, Mask ratio: '
+                logger.info('Iters: {:}, Total loss: {:.3f}, Loss x: {:.3f}, Loss s: {:.3f}, Loss w_fp: {:.3f}, Loss lcr: {:.3f}, Mask ratio: '
                             '{:.3f}'.format(i, total_loss.avg, total_loss_x.avg, total_loss_s.avg,
-                                            total_loss_w_fp.avg, total_mask_ratio.avg))
+                                            total_loss_w_fp.avg, total_loss_lcr.avg, total_mask_ratio.avg))
 
         eval_mode = 'sliding_window' if cfg['dataset'] == 'cityscapes' else 'original'
         mIoU, iou_class = evaluate(model, valloader, eval_mode, cfg)
