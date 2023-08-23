@@ -198,10 +198,10 @@ def main():
             if epoch >= cfg['lcr_start_epoch']:
                 loss_u_lcr = criterion_u(pred_u_masked, mask_u_w)
                 loss_u_lcr = loss_u_lcr * ((conf_u_w >= cfg['lcr_conf_thresh']) & (ignore_mask != 255))
-                loss_u_lcr = loss_u_lcr.sum() /((conf_u_w >= cfg['lcr_conf_thresh']) & (ignore_mask != 255)).sum().item()
+                loss_u_lcr = loss_u_lcr.sum() / ((conf_u_w >= cfg['lcr_conf_thresh']) & (ignore_mask != 255)).sum().item()
                 loss = (loss_x + loss_u_s1 * 0.25 + loss_u_s2 * 0.25 + loss_u_w_fp * 0.5 + loss_u_lcr*cfg['lcr_weight']) / (2.0 + cfg['lcr_weight'])
             else:
-
+                loss_u_lcr = torch.tensor(0.0).cuda()
                 loss = (loss_x + loss_u_s1 * 0.25 + loss_u_s2 * 0.25 + loss_u_w_fp * 0.5) / 2.0
             # loss = (loss_x + loss_u_s1 * 0.25 + loss_u_s2 * 0.25 + loss_u_w_fp * 0.5 + loss_u_lcr*cfg['lcr_weight']) / (2.0 + cfg['lcr_weight'])
 
