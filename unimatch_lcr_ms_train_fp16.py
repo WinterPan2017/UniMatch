@@ -5,6 +5,7 @@ import pprint
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 import torch.backends.cudnn as cudnn
 from torch.optim import SGD
 from torch.utils.data import DataLoader
@@ -55,7 +56,8 @@ def main():
     optimizer = SGD([{'params': model.backbone.parameters(), 'lr': cfg['lr']},
                     {'params': [param for name, param in model.named_parameters() if 'backbone' not in name],
                     'lr': cfg['lr'] * cfg['lr_multi']}], lr=cfg['lr'], momentum=0.9, weight_decay=1e-4)
-    
+    scaler = torch.cuda.amp.GradScaler()
+
     if rank == 0:
         logger.info('Total params: {:.1f}M\n'.format(count_params(model)))
 
@@ -101,6 +103,7 @@ def main():
         optimizer.load_state_dict(checkpoint['optimizer'])
         epoch = checkpoint['epoch']
         previous_best = checkpoint['previous_best']
+        scaler.load_state_dict(checkpoint['scaler_state'])
         
         if rank == 0:
             logger.info('************ Load from checkpoint at epoch %i\n' % epoch)
@@ -143,10 +146,19 @@ def main():
 
             with torch.no_grad():
                 model.eval()
-                pred_u_w_mix = model(img_u_w_mix).detach()
-                conf_u_w_mix = pred_u_w_mix.softmax(dim=1).max(dim=1)[0]
-                mask_u_w_mix = pred_u_w_mix.argmax(dim=1)
-                
+                with torch.cuda.amp.autocast(scaler is not None):
+                    pred_u_w_mix = model(img_u_w_mix).detach()
+
+                    pred_u_w_mix_small = model(F.interpolate(img_u_w_mix, scale_factor=0.7, mode="bilinear", align_corners=True)).detach()
+                    pred_u_w_mix_small = F.interpolate(pred_u_w_mix_small, size=(h, w), mode="bilinear", align_corners=True)
+
+                    pred_u_w_mix_large = model(F.interpolate(img_u_w_mix, scale_factor=1.5, mode="bilinear", align_corners=True)).detach()
+                    pred_u_w_mix_large = F.interpolate(pred_u_w_mix_large, size=(h, w), mode="bilinear", align_corners=True)
+
+                    pred_u_w_mix = (pred_u_w_mix.softmax(dim=1) + pred_u_w_mix_small.softmax(dim=1) + pred_u_w_mix_large.softmax(dim=1)) / 3
+                    conf_u_w_mix = pred_u_w_mix.max(dim=1)[0] 
+                    mask_u_w_mix = pred_u_w_mix.argmax(dim=1)
+                del pred_u_w_mix_small, pred_u_w_mix_large
 
             img_u_s1[cutmix_box1.unsqueeze(1).expand(img_u_s1.shape) == 1] = \
                 img_u_s1_mix[cutmix_box1.unsqueeze(1).expand(img_u_s1.shape) == 1]
@@ -156,16 +168,31 @@ def main():
             model.train()
 
             num_lb, num_ulb = img_x.shape[0], img_u_w.shape[0]
+            with torch.cuda.amp.autocast(scaler is not None):
+                preds, preds_fp = model(torch.cat((img_x, img_u_w)), True)
 
-            preds, preds_fp = model(torch.cat((img_x, img_u_w)), True)
-            pred_x, pred_u_w = preds.split([num_lb, num_ulb])
-            pred_u_w_fp = preds_fp[num_lb:]
+                pred_x, pred_u_w = preds.split([num_lb, num_ulb])
+                pred_u_w_fp = preds_fp[num_lb:]
 
-            pred_u_s1, pred_u_s2, pred_u_masked = model(torch.cat((img_u_s1, img_u_s2, img_masked))).chunk(3)
+                img_u_s12 = torch.cat((img_u_s1, img_u_s2))
+                pred_u_s1_small, pred_u_s2_small = F.interpolate(model(F.interpolate(img_u_s12, scale_factor=0.7, mode="bilinear", align_corners=True)), size=(h, w), mode="bilinear", align_corners=True).chunk(2)
+                pred_u_s1_large, pred_u_s2_large = F.interpolate(model(F.interpolate(img_u_s12, scale_factor=1.5, mode="bilinear", align_corners=True)), size=(h, w), mode="bilinear", align_corners=True).chunk(2)
+                pred_u_s1, pred_u_s2 = model(img_u_s12).chunk(2)
 
-            pred_u_w = pred_u_w.detach()
-            conf_u_w = pred_u_w.softmax(dim=1).max(dim=1)[0]
-            mask_u_w = pred_u_w.argmax(dim=1)
+                pred_u_masked = model(img_masked)
+
+            with torch.no_grad():
+                with torch.cuda.amp.autocast(scaler is not None):
+                    pred_u_w_small = model(F.interpolate(img_u_w, scale_factor=0.7, mode="bilinear", align_corners=True))
+                    pred_u_w_small = F.interpolate(pred_u_w_small, size=(h, w), mode="bilinear", align_corners=True)
+
+                    pred_u_w_large = model(F.interpolate(img_u_w, scale_factor=1.5, mode="bilinear", align_corners=True))
+                    pred_u_w_large = F.interpolate(pred_u_w_large, size=(h, w), mode="bilinear", align_corners=True)
+
+                    pred_u_w = (pred_u_w.softmax(dim=1) + pred_u_w_small.softmax(dim=1) + pred_u_w_large.softmax(dim=1)) / 3
+                    conf_u_w = pred_u_w.max(dim=1)[0]
+                    mask_u_w = pred_u_w.argmax(dim=1)
+                    del pred_u_w_small, pred_u_w_large
 
             mask_u_w_cutmixed1, conf_u_w_cutmixed1, ignore_mask_cutmixed1 = \
                 mask_u_w.clone(), conf_u_w.clone(), ignore_mask.clone()
@@ -180,36 +207,65 @@ def main():
             conf_u_w_cutmixed2[cutmix_box2 == 1] = conf_u_w_mix[cutmix_box2 == 1]
             ignore_mask_cutmixed2[cutmix_box2 == 1] = ignore_mask_mix[cutmix_box2 == 1]
 
-            loss_x = criterion_l(pred_x, mask_x)
+            with torch.cuda.amp.autocast(scaler is not None):
+                loss_x = criterion_l(pred_x, mask_x)
 
-            loss_u_s1 = criterion_u(pred_u_s1, mask_u_w_cutmixed1)
-            loss_u_s1 = loss_u_s1 * ((conf_u_w_cutmixed1 >= cfg['conf_thresh']) & (ignore_mask_cutmixed1 != 255))
-            loss_u_s1 = loss_u_s1.sum() / (ignore_mask_cutmixed1 != 255).sum().item()
+                loss_u_s1 = criterion_u(pred_u_s1, mask_u_w_cutmixed1)
+                loss_u_s1 = loss_u_s1 * ((conf_u_w_cutmixed1 >= cfg['ms_conf_thresh']) & (ignore_mask_cutmixed1 != 255))
+                loss_u_s1 = loss_u_s1.sum() / (ignore_mask_cutmixed1 != 255).sum().item()
 
-            loss_u_s2 = criterion_u(pred_u_s2, mask_u_w_cutmixed2)
-            loss_u_s2 = loss_u_s2 * ((conf_u_w_cutmixed2 >= cfg['conf_thresh']) & (ignore_mask_cutmixed2 != 255))
-            loss_u_s2 = loss_u_s2.sum() / (ignore_mask_cutmixed2 != 255).sum().item()
+                loss_u_s1_small = criterion_u(pred_u_s1_small, mask_u_w_cutmixed1)
+                loss_u_s1_small = loss_u_s1_small * ((conf_u_w_cutmixed1 >= cfg['ms_conf_thresh']) & (ignore_mask_cutmixed1 != 255))
+                loss_u_s1_small = loss_u_s1_small.sum() / (ignore_mask_cutmixed1 != 255).sum().item()
 
-            loss_u_w_fp = criterion_u(pred_u_w_fp, mask_u_w)
-            loss_u_w_fp = loss_u_w_fp * ((conf_u_w >= cfg['conf_thresh']) & (ignore_mask != 255))
-            loss_u_w_fp = loss_u_w_fp.sum() / (ignore_mask != 255).sum().item()
+                loss_u_s1_large = criterion_u(pred_u_s1_large, mask_u_w_cutmixed1)
+                loss_u_s1_large = loss_u_s1_large * ((conf_u_w_cutmixed1 >= cfg['ms_conf_thresh']) & (ignore_mask_cutmixed1 != 255))
+                loss_u_s1_large = loss_u_s1_large.sum() / (ignore_mask_cutmixed1 != 255).sum().item()
 
-            # lcr
-            if epoch >= cfg['lcr_start_epoch']:
-                loss_u_lcr = criterion_u(pred_u_masked, mask_u_w)
-                loss_u_lcr = loss_u_lcr * ((conf_u_w >= cfg['lcr_conf_thresh']) & (ignore_mask != 255))
-                loss_u_lcr = loss_u_lcr.sum() / (ignore_mask != 255).sum().item()
-                loss = (loss_x + loss_u_s1 * 0.25 + loss_u_s2 * 0.25 + loss_u_w_fp * 0.5 + loss_u_lcr*cfg['lcr_weight']) / (2.0 + cfg['lcr_weight'])
-            else:
-                loss_u_lcr = torch.tensor(0.0).cuda()
-                loss = (loss_x + loss_u_s1 * 0.25 + loss_u_s2 * 0.25 + loss_u_w_fp * 0.5) / 2.0
-            # loss = (loss_x + loss_u_s1 * 0.25 + loss_u_s2 * 0.25 + loss_u_w_fp * 0.5 + loss_u_lcr*cfg['lcr_weight']) / (2.0 + cfg['lcr_weight'])
+                loss_u_s1 = (loss_u_s1 + loss_u_s1_small + loss_u_s1_large) / 3
+                del pred_u_s1, pred_u_s1_small, pred_u_s1_large, mask_u_w_cutmixed1, ignore_mask_cutmixed1, conf_u_w_cutmixed1
+
+                loss_u_s2 = criterion_u(pred_u_s2, mask_u_w_cutmixed2)
+                loss_u_s2 = loss_u_s2 * ((conf_u_w_cutmixed2 >= cfg['ms_conf_thresh']) & (ignore_mask_cutmixed2 != 255))
+                loss_u_s2 = loss_u_s2.sum() / (ignore_mask_cutmixed2 != 255).sum().item()
+
+                loss_u_s2_small = criterion_u(pred_u_s2_small, mask_u_w_cutmixed2)
+                loss_u_s2_small = loss_u_s2_small * ((conf_u_w_cutmixed2 >= cfg['ms_conf_thresh']) & (ignore_mask_cutmixed2 != 255))
+                loss_u_s2_small = loss_u_s2_small.sum() / (ignore_mask_cutmixed2 != 255).sum().item()
+
+                loss_u_s2_large = criterion_u(pred_u_s2_large, mask_u_w_cutmixed2)
+                loss_u_s2_large = loss_u_s2_large * ((conf_u_w_cutmixed2 >= cfg['ms_conf_thresh']) & (ignore_mask_cutmixed2 != 255))
+                loss_u_s2_large = loss_u_s2_large.sum() / (ignore_mask_cutmixed2 != 255).sum().item()
+
+                loss_u_s2 = (loss_u_s2 + loss_u_s2_small + loss_u_s2_large) / 3
+                del pred_u_s2, pred_u_s2_small, pred_u_s2_large, mask_u_w_cutmixed2, ignore_mask_cutmixed2, conf_u_w_cutmixed2
+
+                loss_u_w_fp = criterion_u(pred_u_w_fp, mask_u_w)
+                loss_u_w_fp = loss_u_w_fp * ((conf_u_w >= cfg['ms_conf_thresh']) & (ignore_mask != 255))
+                loss_u_w_fp = loss_u_w_fp.sum() / (ignore_mask != 255).sum().item()
+
+                # lcr
+                if epoch >= cfg['lcr_start_epoch']:
+                    loss_u_lcr = criterion_u(pred_u_masked, mask_u_w)
+                    loss_u_lcr = loss_u_lcr * ((conf_u_w >= cfg['ms_conf_thresh']) & (ignore_mask != 255))
+                    loss_u_lcr = loss_u_lcr.sum() / (ignore_mask != 255).sum().item()
+                    loss = (loss_x + loss_u_s1 * 0.25 + loss_u_s2 * 0.25 + loss_u_w_fp * 0.5 + loss_u_lcr*cfg['lcr_weight']) / (2.0 + cfg['lcr_weight'])
+                else:
+                    loss_u_lcr = torch.tensor(0.0).cuda()
+                    loss = (loss_x + loss_u_s1 * 0.25 + loss_u_s2 * 0.25 + loss_u_w_fp * 0.5) / 2.0
+                # loss = (loss_x + loss_u_s1 * 0.25 + loss_u_s2 * 0.25 + loss_u_w_fp * 0.5 + loss_u_lcr*cfg['lcr_weight']) / (2.0 + cfg['lcr_weight'])
+                del pred_u_masked, pred_u_w_fp, mask_u_w
 
             torch.distributed.barrier()
 
             optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            if scaler is None:
+                loss.backward()
+                optimizer.step()
+            else:
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
 
             total_loss.update(loss.item())
             total_loss_x.update(loss_x.item())
@@ -217,9 +273,10 @@ def main():
             total_loss_w_fp.update(loss_u_w_fp.item())
             total_loss_lcr.update(loss_u_lcr.item())
             
-            mask_ratio = ((conf_u_w >= cfg['conf_thresh']) & (ignore_mask != 255)).sum().item() / \
+            mask_ratio = ((conf_u_w >= cfg['ms_conf_thresh']) & (ignore_mask != 255)).sum().item() / \
                 (ignore_mask != 255).sum()
             total_mask_ratio.update(mask_ratio.item())
+            del conf_u_w, ignore_mask
 
             iters = epoch * len(trainloader_u) + i
             lr = cfg['lr'] * (1 - iters / total_iters) ** 0.9
@@ -260,6 +317,7 @@ def main():
                 'optimizer': optimizer.state_dict(),
                 'epoch': epoch,
                 'previous_best': previous_best,
+                "scaler_state": scaler.state_dict(),
             }
             torch.save(checkpoint, os.path.join(args.save_path, 'latest.pth'))
             if is_best:

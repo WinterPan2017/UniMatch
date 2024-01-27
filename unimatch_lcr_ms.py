@@ -5,6 +5,7 @@ import pprint
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 import torch.backends.cudnn as cudnn
 from torch.optim import SGD
 from torch.utils.data import DataLoader
@@ -144,7 +145,15 @@ def main():
             with torch.no_grad():
                 model.eval()
                 pred_u_w_mix = model(img_u_w_mix).detach()
-                conf_u_w_mix = pred_u_w_mix.softmax(dim=1).max(dim=1)[0]
+
+                pred_u_w_mix_small = model(F.interpolate(img_u_w_mix, scale_factor=0.7, mode="bilinear", align_corners=True)).detach()
+                pred_u_w_mix_small = F.interpolate(pred_u_w_mix_small, size=(h, w), mode="bilinear", align_corners=True)
+
+                pred_u_w_mix_large = model(F.interpolate(img_u_w_mix, scale_factor=1.5, mode="bilinear", align_corners=True)).detach()
+                pred_u_w_mix_large = F.interpolate(pred_u_w_mix_large, size=(h, w), mode="bilinear", align_corners=True)
+
+                pred_u_w_mix = (pred_u_w_mix.softmax(dim=1) + pred_u_w_mix_small.softmax(dim=1) + pred_u_w_mix_large.softmax(dim=1)) / 3
+                conf_u_w_mix = pred_u_w_mix.max(dim=1)[0] 
                 mask_u_w_mix = pred_u_w_mix.argmax(dim=1)
                 
 
@@ -158,14 +167,28 @@ def main():
             num_lb, num_ulb = img_x.shape[0], img_u_w.shape[0]
 
             preds, preds_fp = model(torch.cat((img_x, img_u_w)), True)
+
             pred_x, pred_u_w = preds.split([num_lb, num_ulb])
             pred_u_w_fp = preds_fp[num_lb:]
 
-            pred_u_s1, pred_u_s2, pred_u_masked = model(torch.cat((img_u_s1, img_u_s2, img_masked))).chunk(3)
+            pred_u_s1, pred_u_s2 = model(torch.cat((img_u_s1, img_u_s2))).chunk(2)
 
-            pred_u_w = pred_u_w.detach()
-            conf_u_w = pred_u_w.softmax(dim=1).max(dim=1)[0]
-            mask_u_w = pred_u_w.argmax(dim=1)
+            # pred_u_w = pred_u_w.detach()
+            # conf_u_w = pred_u_w.softmax(dim=1).max(dim=1)[0]
+            # mask_u_w = pred_u_w.argmax(dim=1)
+            pred_u_masked = model(img_masked)
+
+            with torch.no_grad():
+                pred_u_w_small = model(F.interpolate(img_u_w, scale_factor=0.7, mode="bilinear", align_corners=True))
+                pred_u_w_small = F.interpolate(pred_u_w_small, size=(h, w), mode="bilinear", align_corners=True)
+
+                pred_u_w_large = model(F.interpolate(img_u_w, scale_factor=1.5, mode="bilinear", align_corners=True))
+                pred_u_w_large = F.interpolate(pred_u_w_large, size=(h, w), mode="bilinear", align_corners=True)
+
+                pred_u_w = pred_u_w.detach()
+                pred_u_w = (pred_u_w.softmax(dim=1) + pred_u_w_small.softmax(dim=1) + pred_u_w_large.softmax(dim=1)) / 3
+                conf_u_w = pred_u_w.max(dim=1)[0]
+                mask_u_w = pred_u_w.argmax(dim=1)
 
             mask_u_w_cutmixed1, conf_u_w_cutmixed1, ignore_mask_cutmixed1 = \
                 mask_u_w.clone(), conf_u_w.clone(), ignore_mask.clone()
@@ -183,21 +206,21 @@ def main():
             loss_x = criterion_l(pred_x, mask_x)
 
             loss_u_s1 = criterion_u(pred_u_s1, mask_u_w_cutmixed1)
-            loss_u_s1 = loss_u_s1 * ((conf_u_w_cutmixed1 >= cfg['conf_thresh']) & (ignore_mask_cutmixed1 != 255))
+            loss_u_s1 = loss_u_s1 * ((conf_u_w_cutmixed1 >= cfg['ms_conf_thresh']) & (ignore_mask_cutmixed1 != 255))
             loss_u_s1 = loss_u_s1.sum() / (ignore_mask_cutmixed1 != 255).sum().item()
 
             loss_u_s2 = criterion_u(pred_u_s2, mask_u_w_cutmixed2)
-            loss_u_s2 = loss_u_s2 * ((conf_u_w_cutmixed2 >= cfg['conf_thresh']) & (ignore_mask_cutmixed2 != 255))
+            loss_u_s2 = loss_u_s2 * ((conf_u_w_cutmixed2 >= cfg['ms_conf_thresh']) & (ignore_mask_cutmixed2 != 255))
             loss_u_s2 = loss_u_s2.sum() / (ignore_mask_cutmixed2 != 255).sum().item()
 
             loss_u_w_fp = criterion_u(pred_u_w_fp, mask_u_w)
-            loss_u_w_fp = loss_u_w_fp * ((conf_u_w >= cfg['conf_thresh']) & (ignore_mask != 255))
+            loss_u_w_fp = loss_u_w_fp * ((conf_u_w >= cfg['ms_conf_thresh']) & (ignore_mask != 255))
             loss_u_w_fp = loss_u_w_fp.sum() / (ignore_mask != 255).sum().item()
 
             # lcr
             if epoch >= cfg['lcr_start_epoch']:
                 loss_u_lcr = criterion_u(pred_u_masked, mask_u_w)
-                loss_u_lcr = loss_u_lcr * ((conf_u_w >= cfg['lcr_conf_thresh']) & (ignore_mask != 255))
+                loss_u_lcr = loss_u_lcr * ((conf_u_w >= cfg['ms_conf_thresh']) & (ignore_mask != 255))
                 loss_u_lcr = loss_u_lcr.sum() / (ignore_mask != 255).sum().item()
                 loss = (loss_x + loss_u_s1 * 0.25 + loss_u_s2 * 0.25 + loss_u_w_fp * 0.5 + loss_u_lcr*cfg['lcr_weight']) / (2.0 + cfg['lcr_weight'])
             else:
@@ -217,7 +240,7 @@ def main():
             total_loss_w_fp.update(loss_u_w_fp.item())
             total_loss_lcr.update(loss_u_lcr.item())
             
-            mask_ratio = ((conf_u_w >= cfg['conf_thresh']) & (ignore_mask != 255)).sum().item() / \
+            mask_ratio = ((conf_u_w >= cfg['ms_conf_thresh']) & (ignore_mask != 255)).sum().item() / \
                 (ignore_mask != 255).sum()
             total_mask_ratio.update(mask_ratio.item())
 
